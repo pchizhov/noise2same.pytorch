@@ -51,7 +51,7 @@ class MLP(nn.Module):
 class DiagWinAttention(nn.Module):
     def __init__(
         self,
-        embed_dim: int = 96,
+        in_channels: int = 96,
         window_size: Tuple[int, int] = (8, 8),
         shuffle_group_size: Tuple[int, int] = (1, 1),
         num_heads: int = 6,
@@ -63,17 +63,17 @@ class DiagWinAttention(nn.Module):
         self.shuffle_group_size = shuffle_group_size
         self.num_patches = np.prod(window_size).item()
         self.num_heads = num_heads
-        self.embed_dim = embed_dim
-        self.scale = (embed_dim // num_heads) ** -0.5
+        self.in_channels = in_channels
+        self.scale = (in_channels // num_heads) ** -0.5
 
         self.softmax = nn.Softmax(dim=-1)
-        self.norm = nn.LayerNorm(embed_dim)
-        self.k = MLP(embed_dim, embed_dim)
-        self.v = MLP(embed_dim, embed_dim)
-        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.norm = nn.LayerNorm(in_channels)
+        self.k = MLP(in_channels, in_channels)
+        self.v = MLP(in_channels, in_channels)
+        self.proj = nn.Linear(in_channels, in_channels)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.shortcut = MLP(embed_dim // num_heads * 2, embed_dim // num_heads)
+        self.shortcut = MLP(in_channels // num_heads * 2, in_channels // num_heads)
 
         relative_position_index, relative_position_bias_table = self.get_relative_position_bias_index_and_table()
         self.relative_position_bias_table = nn.Parameter(relative_position_bias_table)
@@ -105,7 +105,7 @@ class DiagWinAttention(nn.Module):
         return relative_position_index, relative_position_bias_table
 
     def head_partition_and_shuffle(self, x: T) -> T:
-        if x.shape[-1] != self.embed_dim:
+        if x.shape[-1] != self.in_channels:
             return x
         return einops.rearrange(
             x,
@@ -197,7 +197,7 @@ class BlindSpotBlock(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.mlp = MLP(embed_dim, embed_dim, n_layers=2)
         self.attn = DiagWinAttention(
-            embed_dim=embed_dim,
+            in_channels=embed_dim,
             window_size=to_2tuple(window_size),
             shuffle_group_size=self.shuffle_group_size,
             num_heads=num_heads,
@@ -263,16 +263,12 @@ class BlindSpotBlock(nn.Module):
         key: T,
         value: T,
     ) -> Tuple[T, T, T]:
-        image_size = key.shape[1:-1]
-        if query.shape[-1] == self.embed_dim:
-            # Do not normalize in the first layer
-            query = self.norm1(query)
-
         # Shift the image if necessary and partition in windows
         query, key, value = map(self.shift_image, (query, key, value))
         query, key, value = map(self.window_partition, (query, key, value))
 
         # Calculate masked attention (for shifted regions and diagonal)
+        image_size = key.shape[1:-1]
         mask = (
             self.attn_mask
             if image_size == self.input_size
@@ -290,7 +286,7 @@ class BlindSpotBlock(nn.Module):
 
         # Apply MLP with shortcut connection
         # TODO I don't think this is correct to shortcut MLP with MLP
-        query = connect_shortcut(self.shortcut, query, self.mlp(self.norm2(query)))
+        query = query + self.mlp(self.norm2(query))
         return query, key, value
 
 
@@ -302,29 +298,29 @@ class ResidualGroup(nn.Module):
         depth: int = 6,
         num_heads: int = 6,
         stride: int = 1,
+        shifts: Tuple[Tuple[int, int], ...] = ((0, 0),),
     ):
         super().__init__()
-        shift_size = window_size // 2
-        shifts = ((0, 0), (0, shift_size), (shift_size, shift_size), (shift_size, 0))
+        shifts = itertools.cycle(shifts)
         self.blocks = nn.ModuleList([
             BlindSpotBlock(
                 embed_dim=embed_dim,
                 window_size=window_size,
-                shift_size=shifts[i % 4],
+                shift_size=next(shifts),
                 num_heads=num_heads,
                 dilation=stride,
-            ) for i in range(depth)
+            ) for _ in range(depth)
         ])
-        self.mlp = MLP(embed_dim, embed_dim)
         self.shortcut = MLP(embed_dim * 2, embed_dim)
 
     def forward(self, query: T, key: T, value: T) -> Tuple[T, T, T]:
         shortcut = query
         for block in self.blocks:
             query, key, value = block(query, key, value)
-        query = self.mlp(query)
+
         if query.shape[-1] == shortcut.shape[-1]:
             query = connect_shortcut(self.shortcut, query, shortcut)
+
         return query, key, value
 
 
@@ -341,12 +337,15 @@ class SwinIA(nn.Module):
         super().__init__()
         self.window_size = window_size
         self.num_heads = num_heads
+
         self.embed_k = MLP(in_channels, embed_dim)
         self.embed_v = MLP(in_channels, embed_dim)
         self.proj_last = nn.Linear(embed_dim, in_channels)
         self.shortcut = MLP(embed_dim * 2, embed_dim)
         self.absolute_pos_embed = nn.Parameter(torch.zeros(1, window_size ** 2, embed_dim // num_heads[0]))
         trunc_normal_(self.absolute_pos_embed, std=.02)
+
+        shift = window_size // 2
         self.groups = nn.ModuleList([
             ResidualGroup(
                 embed_dim=embed_dim,
@@ -354,6 +353,7 @@ class SwinIA(nn.Module):
                 depth=d,
                 num_heads=n,
                 stride=s,
+                shifts=((0, 0), (0, shift), (shift, 0), (shift, shift)),
             ) for i, (d, n, s) in enumerate(zip(depths, num_heads, strides))
         ])
         self.apply(self._init_weights)
@@ -379,13 +379,9 @@ class SwinIA(nn.Module):
         # Make channel-last for linear layers and attention
         x = einops.rearrange(x, "b c ... -> b ... c")
 
-        # Embed the image to key and value
-        k = self.embed_k(x)
-        v = self.embed_v(x)
-
         # Make query from positional embedding
         wh, ww = x.shape[1] // self.window_size, x.shape[2] // self.window_size
-        full_pos_embed = einops.repeat(
+        q = einops.repeat(
             self.absolute_pos_embed,
             "1 (ws1 ws2) ch -> 1 (wh ws1) (ww ws2) (nh ch)",
             ws1=self.window_size,
@@ -393,21 +389,24 @@ class SwinIA(nn.Module):
             wh=wh,
             ww=ww,
         )
-        q = self.absolute_pos_embed
-        q = einops.rearrange(q, "... c -> ... 1 c")
-        k = k + full_pos_embed
-        v = v + full_pos_embed
+
+        # Embed the image to key and value, add positional embedding
+        k = self.embed_k(x) + q
+        v = self.embed_v(x) + q
+
+        # Build U-Net-like structure with skip connections
         shortcuts = []
         mid = len(self.groups) // 2
-        for i, group in enumerate(self.groups):
-            q, k, v = group(q, k, v)
+        for i, residual_group in enumerate(self.groups):
+            q, k, v = residual_group(q, k, v)
             if i < mid:
                 shortcuts.append((q, k, v))
             elif shortcuts:
                 (q_, k_, v_) = shortcuts.pop()
-                q, k, v = map(
-                    connect_shortcut, [self.shortcut] * 3, (q, k, v), (q_, k_, v_)
-                )
+                # q, k, v = map(connect_shortcut, [self.shortcut] * 3, (q, k, v), (q_, k_, v_))
+                q = connect_shortcut(self.shortcut, q, q_)
+
+        # Project to output channels and make channel-first
         q = self.proj_last(q)
         q = einops.rearrange(q, "b ... c -> b c ...")
         return q
